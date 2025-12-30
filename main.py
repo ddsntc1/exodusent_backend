@@ -55,6 +55,26 @@ def get_redis(app: FastAPI) -> Redis:
     return app.state.redis
 
 
+@app.get("/polls/results", response_model=ResultsResponse)
+async def get_results(
+    session: AsyncSession = Depends(get_session),
+):
+    poll_result = await session.execute(
+        select(Poll)
+        .where(
+            Poll.is_active == 1,
+        )
+        .order_by(Poll.id.desc())
+        .limit(1)
+    )
+    poll = poll_result.scalar_one_or_none()
+    if not poll:
+        raise HTTPException(status_code=404, detail="Active poll not found")
+
+    redis: Redis = get_redis(app)
+    return await _get_results(session, redis, poll.id)
+
+
 @app.get("/polls/{poll_id}", response_model=PollOut)
 async def get_poll(
     poll_id: int,
@@ -159,24 +179,6 @@ async def vote(
     )
 
 
-@app.get("/polls/results", response_model=ResultsResponse)
-async def get_results(
-    session: AsyncSession = Depends(get_session),
-):
-    poll_result = await session.execute(
-        select(Poll)
-        .where(
-            Poll.is_active == 1,
-        )
-        .order_by(Poll.id.desc())
-        .limit(1)
-    )
-    poll = poll_result.scalar_one_or_none()
-    if not poll:
-        raise HTTPException(status_code=404, detail="Active poll not found")
-
-    redis: Redis = get_redis(app)
-    return await _get_results(session, redis, poll.id)
 
 
 @app.websocket("/ws/polls/{poll_id}")
@@ -225,10 +227,9 @@ async def _get_results(
     options = options_result.scalars().all()
 
     total_key, options_key = _redis_keys(poll_id)
-    cached_counts = await redis.hgetall(options_key)
-    cached_total = await redis.get(total_key)
+    cache_ready = await redis.exists(options_key, total_key) == 2
 
-    if not cached_counts and cached_total is None:
+    if not cache_ready:
         counts_result = await session.execute(
             select(Vote.option_id, func.count(Vote.id))
             .where(Vote.poll_id == poll_id)
@@ -236,16 +237,17 @@ async def _get_results(
         )
         counts = {str(row[0]): int(row[1]) for row in counts_result.all()}
         total_votes = sum(counts.values())
-        if counts:
-            await redis.hset(options_key, mapping=counts)
+
+        full_counts = {
+            str(option.id): counts.get(str(option.id), 0) for option in options
+        }
+        await redis.hset(options_key, mapping=full_counts)
         await redis.set(total_key, total_votes)
     else:
+        cached_counts = await redis.hgetall(options_key)
+        cached_total = await redis.get(total_key)
         counts = {str(k): int(v) for k, v in cached_counts.items()}
-        if cached_total is None:
-            total_votes = sum(counts.values())
-            await redis.set(total_key, total_votes)
-        else:
-            total_votes = int(cached_total)
+        total_votes = int(cached_total) if cached_total is not None else 0
 
     results = [
         ResultItem(
